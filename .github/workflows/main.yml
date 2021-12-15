@@ -2,79 +2,61 @@ name: CI
 
 on:
   push:
-    tags:
-      - 'v*.*.*'
-      - '!v0.1.*'
+    branches:
+      - master
+      - modified-build-setup
+  pull_request:
+    branches: [ master ]
 
 jobs:
-  base:
+  build_and_push:
+    # The type of runner that the job will run on
     runs-on: ubuntu-latest
 
-    outputs:
-      go_version: ${{ steps.get_versions.outputs.go_version }}
-      build_version: ${{ steps.get_versions.outputs.build_version }}
-      chart_version: ${{ steps.get_versions.outputs.chart_version }}
-      go_updated: ${{ steps.file_updates.outputs.go }}
-      yaml_updated: ${{ steps.file_updates.outputs.yaml }}
-
+    # Steps represent a sequence of tasks that will be executed as part of the job
     steps:
-      - name: Check out repo
+      - name: Checkout
         uses: actions/checkout@v2
         with:
           fetch-depth: 0
-
-      - name: Get versions
-        id: get_versions
+      
+      - name: Repo metadata
+        id: repo
+        uses: actions/github-script@v3
+        with:
+          script: |
+            const repo = await github.repos.get(context.repo)
+            return repo.data
+      
+      - name: Prepare
+        id: prep
         run: |
+          DOCKER_IMAGE=ghcr.io/${{ github.repository }}
+          VERSION=noop
+          if [[ $GITHUB_REF == refs/tags/* ]]; then
+            VERSION=${GITHUB_REF#refs/tags/}
+          elif [[ $GITHUB_REF == refs/heads/* ]]; then
+            VERSION=$(echo ${GITHUB_REF#refs/heads/} | sed -r 's#/+#-#g')
+          fi
+          TAGS="${DOCKER_IMAGE}:${VERSION}"
+          if [[ $VERSION =~ ^v[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+            MINOR=${VERSION%.*}
+            MAJOR=${MINOR%.*}
+            TAGS="$TAGS,${DOCKER_IMAGE}:${MINOR},${DOCKER_IMAGE}:${MAJOR},${DOCKER_IMAGE}:latest"
+          elif [ "${{ github.event_name }}" = "push" ]; then
+            TAGS="$TAGS,${DOCKER_IMAGE}:sha-${GITHUB_SHA::7}"
+          fi
+          echo ::set-output name=version::${VERSION}
+          echo ::set-output name=tags::${TAGS}
+          echo ::set-output name=created::$(date -u +'%Y-%m-%dT%H:%M:%SZ')
           echo ::set-output name=go_version::$(go mod edit -json | grep -Po '"Go":\s+"([0-9.]+)"' | sed -E 's/.+"([0-9.]+)"/\1/')
-          echo ::set-output name=build_version::${GITHUB_REF#refs/tags/v}
-          echo ::set-output name=chart_version::${GITHUB_REF#refs/tags/}
-
-      - name: Get last release
-        id: last_release
-        shell: bash
-        run: |
-          tag=$(gh release list | sed -n '1 p' | awk '{print $(NF -1);}')
-          sha=$(git show-ref --tags | grep $tag | awk '{print $1;}')
-          echo ::set-output name=sha::$sha
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Check updated files
-        id: file_updates
-        uses: dorny/paths-filter@v2
-        with:
-          base: ${{ steps.last_release.outputs.sha }}
-          filters: |
-            go:
-              - '*.go'
-              - 'go.*'
-            yaml:
-              - 'deploy/cert-manager-webhook-gandi/*.yaml'
-              - 'deploy/cert-manager-webhook-gandi/templates/*.yaml'
-
-  build:
-    needs: base
-    if: ${{ needs.base.outputs.go_updated == 'true' }}
-
-    runs-on: ubuntu-latest
-
-    outputs:
-      tag_commit: ${{ steps.update_image.outputs.commit }}
-
-    steps:
-      - name: Check out repo
-        uses: actions/checkout@v2
-
-      - name: Login to Docker Hub
-        uses: docker/login-action@v1
-        with:
-          username: ${{ secrets.DOCKER_USERNAME }}
-          password: ${{ secrets.DOCKER_PASSWORD }}
-
-      - name: Set up Docker buildx
+      
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v1
+      
+      - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v1
-
+      
       - name: Cache Docker layers
         uses: actions/cache@v2
         with:
@@ -82,19 +64,33 @@ jobs:
           key: ${{ runner.os }}-buildx-${{ github.sha }}
           restore-keys: |
             ${{ runner.os }}-buildx-
+      
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v1 
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.CR_PAT }}
 
       - name: Build and push
         uses: docker/build-push-action@v2
         with:
-          context: ./
+          context: .
           file: ./Dockerfile
-          platforms: linux/amd64
-          target: image
+          platforms: linux/amd64,linux/arm64
           push: true
-          build-args: GO_VERSION=${{ needs.base.outputs.go_version }}
-          tags: bwolf/cert-manager-webhook-gandi:latest,bwolf/cert-manager-webhook-gandi:${{ needs.base.outputs.build_version }}
+          build-args: GO_VERSION=${{ steps.prep.outputs.go_version }}
           cache-from: type=local,src=/tmp/.buildx-cache
           cache-to: type=local,dest=/tmp/.buildx-cache-new,mode=max
+          tags: ${{ steps.prep.outputs.tags }}
+          labels: |
+            org.opencontainers.image.title=${{ fromJson(steps.repo.outputs.result).name }}
+            org.opencontainers.image.description=${{ fromJson(steps.repo.outputs.result).description }}
+            org.opencontainers.image.url=${{ fromJson(steps.repo.outputs.result).html_url }}
+            org.opencontainers.image.source=${{ fromJson(steps.repo.outputs.result).clone_url }}
+            org.opencontainers.image.version=${{ steps.prep.outputs.version }}
+            org.opencontainers.image.created=${{ steps.prep.outputs.created }}
+            org.opencontainers.image.revision=${{ github.sha }}
 
       # Temp fix
       # https://github.com/docker/build-push-action/issues/252
@@ -103,70 +99,3 @@ jobs:
         run: |
           rm -rf /tmp/.buildx-cache
           mv /tmp/.buildx-cache-new /tmp/.buildx-cache
-
-      - name: Update Helm image tag
-        id: update_image
-        uses: fjogeleit/yaml-update-action@master
-        with:
-          valueFile: 'deploy/cert-manager-webhook-gandi/values.yaml'
-          propertyPath: 'image.tag'
-          value: ${{ needs.base.outputs.build_version }}
-          message: 'Update image tag to ${{ needs.base.outputs.build_version }}'
-          token: ${{ secrets.GITHUB_TOKEN }}
-
-  release:
-    needs:
-      - base
-      - build
-
-    if: |
-      always() && needs.base.result == 'success' &&
-      ((needs.build.result == 'success' && needs.build.outputs.tag_commit != '' ) || (needs.build.result == 'skipped' && needs.base.outputs.yaml_updated == 'true'))
-
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Retrieve commit ref
-        id: commit_ref
-        run: |
-          if [[ '${{ needs.build.outputs.tag_commit }}' = '' ]]; then
-            sha=${{ github.sha }}
-          else
-            sha=${{ needs.build.outputs.tag_commit }}
-          fi
-
-          echo ::set-output name=sha::$sha
-
-      - name: Check out repo
-        uses: actions/checkout@v2
-        with:
-          fetch-depth: 0
-          ref: ${{ steps.commit_ref.outputs.sha }}
-
-      - name: Configure Git
-        run: |
-          git config user.name github-actions
-          git config user.email github-actions@github.com
-
-      - name: Update Helm chart version
-        uses: fjogeleit/yaml-update-action@master
-        with:
-          valueFile: 'deploy/cert-manager-webhook-gandi/Chart.yaml'
-          propertyPath: 'version'
-          value: ${{ needs.base.outputs.chart_version }}
-          message: 'Update chart version to ${{ needs.base.outputs.chart_version }}'
-          token: ${{ secrets.GITHUB_TOKEN }}
-          updateFile: true
-
-      - name: Install Helm
-        uses: azure/setup-helm@v1
-        with:
-          version: v3.4.0
-
-      - name: Run chart-releaser
-        uses: helm/chart-releaser-action@v1.2.1
-        with:
-          charts_dir: deploy
-        env:
-          CR_RELEASE_NAME_TEMPLATE: '{{ .Version }}'
-          CR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
